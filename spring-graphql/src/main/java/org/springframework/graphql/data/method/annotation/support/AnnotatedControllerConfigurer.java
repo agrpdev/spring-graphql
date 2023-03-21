@@ -48,6 +48,7 @@ import reactor.core.publisher.Mono;
 
 import org.springframework.aop.support.AopUtils;
 import org.springframework.beans.factory.InitializingBean;
+import org.springframework.beans.factory.NoSuchBeanDefinitionException;
 import org.springframework.context.ApplicationContext;
 import org.springframework.context.ApplicationContextAware;
 import org.springframework.context.expression.BeanFactoryResolver;
@@ -57,20 +58,22 @@ import org.springframework.core.MethodParameter;
 import org.springframework.core.ResolvableType;
 import org.springframework.core.annotation.AnnotatedElementUtils;
 import org.springframework.core.convert.ConversionService;
-import org.springframework.expression.BeanResolver;
+import org.springframework.data.domain.ScrollPosition;
 import org.springframework.format.FormatterRegistrar;
 import org.springframework.format.support.DefaultFormattingConversionService;
 import org.springframework.format.support.FormattingConversionService;
 import org.springframework.graphql.data.GraphQlArgumentBinder;
-import org.springframework.graphql.execution.SelfDescribingDataFetcher;
 import org.springframework.graphql.data.method.HandlerMethod;
 import org.springframework.graphql.data.method.HandlerMethodArgumentResolver;
 import org.springframework.graphql.data.method.HandlerMethodArgumentResolverComposite;
 import org.springframework.graphql.data.method.annotation.BatchMapping;
 import org.springframework.graphql.data.method.annotation.SchemaMapping;
+import org.springframework.graphql.data.pagination.CursorStrategy;
+import org.springframework.graphql.data.query.SortStrategy;
 import org.springframework.graphql.execution.BatchLoaderRegistry;
 import org.springframework.graphql.execution.DataFetcherExceptionResolver;
 import org.springframework.graphql.execution.RuntimeWiringConfigurer;
+import org.springframework.graphql.execution.SelfDescribingDataFetcher;
 import org.springframework.graphql.execution.SubscriptionPublisherException;
 import org.springframework.lang.Nullable;
 import org.springframework.stereotype.Controller;
@@ -80,20 +83,44 @@ import org.springframework.util.StringUtils;
 import org.springframework.validation.DataBinder;
 
 /**
- * {@link RuntimeWiringConfigurer} that detects {@link SchemaMapping @SchemaMapping}
- * annotated handler methods in {@link Controller @Controller} classes and
- * registers them as {@link DataFetcher}s.
+ * {@link RuntimeWiringConfigurer} that finds {@link SchemaMapping @SchemaMapping}
+ * annotated handler methods in {@link Controller @Controller} classes declared in
+ * Spring configuration, and registers them as {@link DataFetcher}s.
  *
  * <p>In addition to initializing a {@link RuntimeWiring.Builder}, this class, also
  * provides an option to {@link #configure(GraphQLCodeRegistry.Builder) configure}
  * data fetchers on a {@link GraphQLCodeRegistry.Builder}.
  *
+ * <p>This class detects the following strategies in Spring configuration,
+ * expecting to find a single, unique bean of that type:
+ * <ul>
+ * <li>{@link CursorStrategy} -- if Spring Data is present, and the strategy
+ * supports {@code ScrollPosition}, then {@link ScrollSubrangeMethodArgumentResolver}
+ * is configured for use. If not, then {@link SubrangeMethodArgumentResolver}
+ * is added instead.
+ * <li>{@link SortStrategy} -- if present, then {@link SortMethodArgumentResolver}
+ * is configured for use.
+ * </ul>
+ *
+ *
+ *
  * @author Rossen Stoyanchev
  * @author Brian Clozel
  * @since 1.0.0
  */
-public class AnnotatedControllerConfigurer
-		implements ApplicationContextAware, InitializingBean, RuntimeWiringConfigurer {
+public class AnnotatedControllerConfigurer implements ApplicationContextAware, InitializingBean, RuntimeWiringConfigurer {
+
+	private static final ClassLoader classLoader = AnnotatedControllerConfigurer.class.getClassLoader();
+
+	private final static boolean springDataPresent = ClassUtils.isPresent(
+			"org.springframework.data.projection.SpelAwareProxyProjectionFactory", classLoader);
+
+	private final static boolean springSecurityPresent = ClassUtils.isPresent(
+			"org.springframework.security.core.context.SecurityContext", classLoader);
+
+	private final static boolean beanValidationPresent = ClassUtils.isPresent(
+			"jakarta.validation.executable.ExecutableValidator", classLoader);
+
 
 	private final static Log logger = LogFactory.getLog(AnnotatedControllerConfigurer.class);
 
@@ -108,18 +135,6 @@ public class AnnotatedControllerConfigurer
 	 * but duplicated here to avoid a hard dependency on the spring-aop module.
 	 */
 	private static final String SCOPED_TARGET_NAME_PREFIX = "scopedTarget.";
-
-	private final static boolean springDataPresent = ClassUtils.isPresent(
-			"org.springframework.data.projection.SpelAwareProxyProjectionFactory",
-			AnnotatedControllerConfigurer.class.getClassLoader());
-
-	private final static boolean springSecurityPresent = ClassUtils.isPresent(
-			"org.springframework.security.core.context.SecurityContext",
-			AnnotatedControllerConfigurer.class.getClassLoader());
-
-	private final static boolean beanValidationPresent = ClassUtils.isPresent(
-			"jakarta.validation.executable.ExecutableValidator",
-			AnnotatedControllerConfigurer.class.getClassLoader());
 
 
 	private final FormattingConversionService conversionService = new DefaultFormattingConversionService();
@@ -251,10 +266,12 @@ public class AnnotatedControllerConfigurer
 		// Type based
 		resolvers.addResolver(new DataFetchingEnvironmentMethodArgumentResolver());
 		resolvers.addResolver(new DataLoaderMethodArgumentResolver());
+		addSubrangeMethodArgumentResolver(resolvers);
+		addSortMethodArgumentResolver(resolvers);
 		if (springSecurityPresent) {
+			ApplicationContext context = obtainApplicationContext();
 			resolvers.addResolver(new PrincipalMethodArgumentResolver());
-			BeanResolver beanResolver = new BeanFactoryResolver(obtainApplicationContext());
-			resolvers.addResolver(new AuthenticationPrincipalArgumentResolver(beanResolver));
+			resolvers.addResolver(new AuthenticationPrincipalArgumentResolver(new BeanFactoryResolver(context)));
 		}
 		if (KotlinDetector.isKotlinPresent()) {
 			resolvers.addResolver(new ContinuationHandlerMethodArgumentResolver());
@@ -266,6 +283,36 @@ public class AnnotatedControllerConfigurer
 		resolvers.addResolver(new SourceMethodArgumentResolver());
 
 		return resolvers;
+	}
+
+	@SuppressWarnings({"unchecked", "CastCanBeRemovedNarrowingVariableType"})
+	private void addSubrangeMethodArgumentResolver(HandlerMethodArgumentResolverComposite resolvers) {
+		try {
+			CursorStrategy<?> strategy = obtainApplicationContext().getBean(CursorStrategy.class);
+			if (springDataPresent) {
+				if (strategy.supports(ScrollPosition.class)) {
+					CursorStrategy<ScrollPosition> strategyToUse = (CursorStrategy<ScrollPosition>) strategy;
+					resolvers.addResolver(new ScrollSubrangeMethodArgumentResolver(strategyToUse));
+					return;
+				}
+			}
+			resolvers.addResolver(new SubrangeMethodArgumentResolver<>(strategy));
+		}
+		catch (NoSuchBeanDefinitionException ex) {
+			// ignore
+		}
+	}
+
+	private void addSortMethodArgumentResolver(HandlerMethodArgumentResolverComposite resolvers) {
+		if (springDataPresent) {
+			try {
+				SortStrategy strategy = obtainApplicationContext().getBean(SortStrategy.class);
+				resolvers.addResolver(new SortMethodArgumentResolver(strategy));
+			}
+			catch (NoSuchBeanDefinitionException ex) {
+				// ignore
+			}
+		}
 	}
 
 	protected final ApplicationContext obtainApplicationContext() {
@@ -617,18 +664,21 @@ public class AnnotatedControllerConfigurer
 			return result;
 		}
 
-		private Mono<DataFetcherResult<?>> handleException(
+		private Mono<DataFetcherResult<Object>> handleException(
 				Throwable ex, DataFetchingEnvironment env, DataFetcherHandlerMethod handlerMethod) {
 
 			return this.exceptionResolver.resolveException(ex, env, handlerMethod.getBean())
-					.map(errors -> DataFetcherResult.newResult().errors(errors).build());
+					.map(errors -> DataFetcherResult.newResult().errors(errors).build())
+					.switchIfEmpty(Mono.error(ex));
 		}
 
+		@SuppressWarnings("unchecked")
 		private <T> Publisher<T> handleSubscriptionError(
 				Throwable ex, DataFetchingEnvironment env, DataFetcherHandlerMethod handlerMethod) {
 
-			return this.exceptionResolver.resolveException(ex, env, handlerMethod.getBean())
-					.flatMap(errors -> Mono.error(new SubscriptionPublisherException(errors, ex)));
+			return (Publisher<T>) this.exceptionResolver.resolveException(ex, env, handlerMethod.getBean())
+					.flatMap(errors -> Mono.error(new SubscriptionPublisherException(errors, ex)))
+					.switchIfEmpty(Mono.error(ex));
 		}
 
 		@Override

@@ -568,6 +568,146 @@ to send to the client.
 
 
 
+[[execution.pagination]]
+=== Pagination
+
+The GraphQL Cursor Connection https://relay.dev/graphql/connections.htm[specification]
+defines a mechanism for efficient navigation of large result sets by returning a limited
+set of items at a time. Each item is paired with a cursor that a client can use to request
+the items after or before the cursor, providing a way to navigate forward and backward.
+
+The spec calls the pattern "Connections". A schema type whose name ends on "Connection"
+is considered a _Connection Type_ and represents a paginated result set. A `Connection`
+contains "edges" where an `Edge` is a wrapper around the actual item and its cursor.
+There is also a `PageInfo` to indicate whether there are more items forward and backward.
+
+
+[[execution.pagination.types]]
+==== Connection Types
+
+`Connection` type definitions must be repeated for every type that needs pagination, adding
+boilerplate and noise to the schema. Spring for GraphQL provides
+`ConnectionTypeDefinitionConfigurer` to generate these types on startup, if not already
+present in the parsed schema files. That means you can have a `Connection` field without
+a type declaration as follows:
+
+[source,graphql,indent=0,subs="verbatim,quotes"]
+----
+	Query {
+		books: BookConnection
+	}
+
+	type Book {
+		id: ID!
+		title: String!
+	}
+----
+
+Configure `ConnectionTypeDefinitionConfigurer` as follows:
+
+[source,java,indent=0,subs="verbatim,quotes"]
+----
+GraphQlSource.schemaResourceBuilder()
+		.schemaResources(..)
+		.typeDefinitionConfigurer(new ConnectionTypeDefinitionConfigurer)
+----
+
+The following type definitions will be added to the schema on startup:
+
+[source,graphql,indent=0,subs="verbatim,quotes"]
+----
+	type BookConnection {
+		edges: [BookEdge]!
+		pageInfo: PageInfo!
+	}
+
+	type BookEdge {
+		node: Book!
+		cursor: String!
+	}
+
+	type PageInfo {
+		hasPreviousPage: Boolean!
+		hasNextPage: Boolean!
+		startCursor: String
+		endCursor: String
+	}
+----
+
+The <<boot-starter>> registers `ConnectionTypeDefinitionConfigurer` by default.
+
+
+[[execution.pagination.adapters]]
+==== `ConnectionAdapter`
+
+Once <<execution.pagination.types>> are available in the schema, you also need
+equivalent Java types. GraphQL Java provides those, including generic `Connection` and
+`Edge`, as well as a `PageInfo`.
+
+One option is to populate a `Connection` and return it from your controller method or
+`DataFetcher`. However, this requires boilerplate code to create the `Connection`,
+creating cursors, wrapping each item as an `Edge`, and creating the `PageInfo`.
+Moreover, you may already have an underlying pagination mechanism such as when using
+Spring Data repositories.
+
+Spring for GraphQL defines the `ConnectionAdapter` contract to adapt a container of items
+to `Connection`. Adapters are applied through a `DataFetcher` decorator that is in turn
+installed through a `ConnectionFieldTypeVisitor`. You can configure it as follows:
+
+[source,java,indent=0,subs="verbatim,quotes"]
+----
+ConnectionAdapter adapter = ... ;
+GraphQLTypeVisitor visitor = ConnectionFieldTypeVisitor.create(List.of(adapter)) // <1>
+
+GraphQlSource.schemaResourceBuilder()
+		.schemaResources(..)
+		.typeDefinitionConfigurer(..)
+		.typeVisitors(List.of(visitor)) // <2>
+----
+
+<1> Create type visitor with one or more ``ConnectionAdapter``s.
+<2> Resister the type visitor.
+
+There are <<data.pagination.scroll,built-in>> ``ConnectionAdapter``s for Spring Data's
+`Window` and `Slice`. You can also create your own custom adapter. `ConnectionAdapter`
+implementations rely on a <<execution.pagination.cursor.strategy>> to
+create cursors for returned items. The same strategy is also used to support the
+<<controllers.schema-mapping.subrange>> controller method argument that contains
+pagination input.
+
+
+[[execution.pagination.cursor.strategy]]
+==== `CursorStrategy`
+
+`CursorStrategy` is a contract to create a String cursor for an item to reflect its
+position within a large result set, e.g. based on an offset or key set.
+<<execution.pagination.adapters>> implementations use this to create cursors for returned
+items.
+
+The strategy also supports the <<controllers.schema-mapping.subrange>> controller
+method argument. For this to work, you need to declare a `CursorStrategy` bean, and also
+ensure that annotated controllers are <<controllers-declaration, configured>> for use.
+
+`CursorEncoder` is a related, supporting strategy to encode and decode cursors to make
+them opaque to clients. `EncodingCursorStrategy` combines `CursorStrategy` with a
+`CursorEncoder`. You can use `Base64CursorEncoder`, `NoOpEncoder` or create your own.
+
+There is a <<data.pagination.scroll,built-in>> `CursorStrategy` for the Spring Data
+`ScrollPosition`. The <<boot-starter>> registers a `ScrollPositionCursorStrategy` with
+`Base64Encoder` when Spring Data is present.
+
+
+[[execution.pagination.sort.strategy]]
+==== Sort
+
+There is no standard way to provide sort information in a GraphQL request. However,
+pagination depends on a stable sort order. You can use a default order, or otherwise
+expose input types and extract sort details from GraphQL arguments.
+
+There is <<data.pagination.sort,built-in>> support for Spring Data's `Sort` as a controller
+method argument. For this to work, you need to have a `SortStrategy` bean.
+
+
 [[execution.batching]]
 === Batch Loading
 
@@ -1048,6 +1188,57 @@ required fields (or columns) are part of the database query result.
 
 
 
+[[data.pagination.scroll]]
+=== Scroll
+
+As explained in <<execution.pagination>>, the GraphQL Cursor Connection spec defines a
+mechanism for pagination with `Connection`, `Edge`, and `PageInfo` schema types, while
+GraphQL Java provides the equivalent Java type representations.
+
+Spring for GraphQL provides built-in ``ConnectionAdapter`` implementations to adapt the
+Spring Data pagination types `Window` and `Slice` transparently. You can configure that
+as follows:
+
+[source,java,indent=0,subs="verbatim,quotes"]
+----
+CursorStrategy<ScrollPosition> strategy = CursorStrategy.withEncoder(
+		new ScrollPositionCursorStrategy(),
+		CursorEncoder.base64()); // <1>
+
+GraphQLTypeVisitor visitor = ConnectionFieldTypeVisitor.create(List.of(
+		new WindowConnectionAdapter(strategy),
+		new SliceConnectionAdapter(strategy))); // <2>
+
+GraphQlSource.schemaResourceBuilder()
+		.schemaResources(..)
+		.typeDefinitionConfigurer(..)
+		.typeVisitors(List.of(visitor)); // <3>
+----
+
+<1> Create strategy to convert `ScrollPosition` to a Base64 encoded cursor.
+<2> Create type visitor to adapt `Window` and `Slice` returned from ``DataFetcher``s.
+<3> Register the type visitor.
+
+On the request side, a controller method can declare a
+<<controllers.schema-mapping.subrange,ScrollSubrange>> method argument to paginate forward
+or backward. For this to work, you must declare a <<execution.pagination.cursor.strategy>>
+supports `ScrollPosition` as a bean.
+
+The <<boot-starter>> declares a `CursorStrategy<ScrollPosition>` bean, and registers the
+`ConnectionFieldTypeVisitor` as shown above if Spring Data is on the classpath.
+
+
+
+[[data.pagination.sort]]
+=== Sort
+
+Spring for GraphQL defines a `SortStrategy` to create `Sort` from GraphQL arguments.
+`AbstractSortStrategy` implements the contract with abstract methods to extract the sort
+direction and properties. To enable support for `Sort` as a controller method argument,
+you need to declare a `SortStrategy` bean.
+
+
+
 
 [[controllers]]
 == Annotated Controllers
@@ -1217,6 +1408,16 @@ See <<controllers.schema-mapping.projectedpayload.argument>>.
 | For access to the source (i.e. parent/container) instance of the field.
 
 See <<controllers.schema-mapping.source>>.
+
+| `Subrange` and `ScrollSubrange`
+| For access to pagination arguments.
+
+See <<execution.pagination>>, <<data.pagination.scroll>>, <<controllers.schema-mapping.subrange>>.
+
+| `Sort`
+| For access to sort details.
+
+See <<execution.pagination>>, <<controllers.schema-mapping.sort>>.
 
 | `DataLoader`
 | For access to a `DataLoader` in the `DataLoaderRegistry`.
@@ -1453,6 +1654,51 @@ explicitly specify the type name in the `@SchemaMapping` annotation.
 A <<controllers.batch-mapping>> handler method can batch load all authors for a query,
 given a list of source/parent books objects.
 ====
+
+
+[[controllers.schema-mapping.subrange]]
+==== `Subrange`
+
+When there is a <<execution.pagination.cursor.strategy>> bean in Spring configuration,
+controller methods support a `Subrange<P>` argument where `<P>` is a relative position
+converted from a cursor. For Spring Data, `ScrollSubrange` exposes `ScrollPosition`.
+For example:
+
+[source,java,indent=0,subs="verbatim,quotes"]
+----
+@Controller
+public class BookController {
+
+	@QueryMapping
+	public Window<Book> books(ScrollSubrange subrange) {
+		ScrollPosition position = subrange.position().orElse(OffsetScrollPosition.initial())
+		int count = subrange.count().orElse(20);
+		// ...
+	}
+
+}
+----
+
+
+[[controllers.schema-mapping.sort]]
+==== `Sort`
+
+When there is a <<data.pagination.scroll,SortStrategy>> bean in Spring configuration, controller
+methods support `Sort` as a method argument. For example:
+
+[source,java,indent=0,subs="verbatim,quotes"]
+----
+@Controller
+public class BookController {
+
+	@QueryMapping
+	public Window<Book> books(Optional<Sort> optionalSort) {
+		Sort sort = optionalSort.orElse(Sort.by(..));
+	}
+
+}
+----
+
 
 
 [[controllers.schema-mapping.data-loader]]
